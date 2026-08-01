@@ -15596,6 +15596,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        # A lifecycle observer may need to verify a reply against a prior
+        # provider receipt, but it must never choose this native session.  Emit
+        # only after the ordinary session store has resolved the actual record;
+        # the helper ignores non-replies and stores no text or raw update data.
+        try:
+            from gateway.lifecycle_events import record_inbound_from_event
+
+            record_inbound_from_event(
+                event,
+                actual_session_id=session_entry.session_id,
+                actual_session_key=session_entry.session_key,
+            )
+        except Exception:
+            logger.debug("gateway lifecycle inbound receipt failed", exc_info=True)
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).

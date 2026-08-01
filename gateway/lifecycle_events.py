@@ -21,13 +21,17 @@ from hermes_constants import get_hermes_home
 
 
 EVENT_VERSION = 1
-EVENT_TYPES = frozenset({"delivery"})
-_REQUIRED_FIELDS = frozenset(
+EVENT_TYPES = frozenset({"delivery", "inbound", "outbound"})
+_COMMON_REQUIRED_FIELDS = frozenset(
     {
         "event_id",
         "event_type",
         "event_version",
         "occurred_at",
+    }
+)
+_DELIVERY_REQUIRED_FIELDS = frozenset(
+    {
         "dispatch_id",
         "activation_attempt_id",
         "route_revision",
@@ -39,7 +43,37 @@ _REQUIRED_FIELDS = frozenset(
         "actual_session_id",
     }
 )
-_ALLOWED_FIELDS = _REQUIRED_FIELDS | frozenset({"gateway_revision"})
+_INBOUND_REQUIRED_FIELDS = frozenset(
+    {
+        "provider_event_id",
+        "parent_message_id",
+        "platform",
+        "chat_id",
+        "thread_id",
+        "sender_id",
+        "gateway_profile",
+        "actual_session_id",
+        "actual_session_key",
+    }
+)
+_OUTBOUND_REQUIRED_FIELDS = frozenset(
+    {
+        "provider_message_ids",
+        "canonical_parent_message_id",
+        "causal_inbound_event_id",
+        "platform",
+        "chat_id",
+        "thread_id",
+        "gateway_profile",
+        "actual_session_id",
+        "actual_session_key",
+    }
+)
+_ALLOWED_FIELDS_BY_TYPE = {
+    "delivery": _COMMON_REQUIRED_FIELDS | _DELIVERY_REQUIRED_FIELDS | frozenset({"gateway_revision"}),
+    "inbound": _COMMON_REQUIRED_FIELDS | _INBOUND_REQUIRED_FIELDS | frozenset({"gateway_revision"}),
+    "outbound": _COMMON_REQUIRED_FIELDS | _OUTBOUND_REQUIRED_FIELDS | frozenset({"gateway_revision"}),
+}
 _LEASE_SECONDS = 60
 
 
@@ -57,6 +91,7 @@ def _connect() -> sqlite3.Connection:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS gateway_lifecycle_events (
             event_id TEXT PRIMARY KEY,
+            dedupe_key TEXT,
             payload_json TEXT NOT NULL,
             state TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
@@ -64,6 +99,15 @@ def _connect() -> sqlite3.Connection:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )"""
+    )
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(gateway_lifecycle_events)")
+    }
+    if "dedupe_key" not in columns:
+        conn.execute("ALTER TABLE gateway_lifecycle_events ADD COLUMN dedupe_key TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS gateway_lifecycle_events_dedupe_key "
+        "ON gateway_lifecycle_events(dedupe_key) WHERE dedupe_key IS NOT NULL"
     )
     return conn
 
@@ -87,30 +131,71 @@ def validate_event(event: dict[str, Any]) -> dict[str, Any]:
     """
     if not isinstance(event, dict):
         return {"ok": False, "errors": ["event must be an object"]}
-    unknown = sorted(set(event) - _ALLOWED_FIELDS)
-    missing = sorted(name for name in _REQUIRED_FIELDS if name not in event)
+    event_type = event.get("event_type")
+    allowed = _ALLOWED_FIELDS_BY_TYPE.get(event_type, _COMMON_REQUIRED_FIELDS)
+    required = allowed - {"gateway_revision"}
+    unknown = sorted(set(event) - allowed)
+    missing = sorted(name for name in required if name not in event)
     errors = [f"unknown field: {name}" for name in unknown]
     errors.extend(f"missing field: {name}" for name in missing)
+    if event_type not in EVENT_TYPES:
+        errors.append("unsupported event_type")
     if errors:
         return {"ok": False, "errors": errors}
-
-    if event["event_type"] not in EVENT_TYPES:
-        errors.append("unsupported event_type")
     if event["event_version"] != EVENT_VERSION:
         errors.append("unsupported event_version")
-    for field in (
-        "event_id",
-        "dispatch_id",
-        "activation_attempt_id",
-        "route_revision",
-        "destination_revision",
-        "plugin_revision",
-        "expected_conversation_key",
-    ):
+    for field in ("event_id",):
         if not isinstance(event[field], str) or not event[field].strip():
             errors.append(f"{field} must be a non-empty string")
     if not isinstance(event["occurred_at"], (int, float)):
         errors.append("occurred_at must be numeric")
+    if event_type == "delivery":
+        for field in (
+            "dispatch_id",
+            "activation_attempt_id",
+            "route_revision",
+            "destination_revision",
+            "plugin_revision",
+            "expected_conversation_key",
+        ):
+            if not isinstance(event[field], str) or not event[field].strip():
+                errors.append(f"{field} must be a non-empty string")
+        _validate_provider_ids(event, errors)
+        if event["actual_session_id"] is not None:
+            errors.append("delivery actual_session_id must remain unresolved")
+    elif event_type == "inbound":
+        for field in (
+            "provider_event_id",
+            "parent_message_id",
+            "platform",
+            "chat_id",
+            "sender_id",
+            "actual_session_id",
+            "actual_session_key",
+        ):
+            if not isinstance(event[field], str) or not event[field].strip():
+                errors.append(f"{field} must be a non-empty string")
+        for field in ("thread_id", "gateway_profile"):
+            if event[field] is not None and not isinstance(event[field], str):
+                errors.append(f"{field} must be a string or null")
+    elif event_type == "outbound":
+        for field in (
+            "causal_inbound_event_id",
+            "platform",
+            "chat_id",
+            "actual_session_id",
+            "actual_session_key",
+        ):
+            if not isinstance(event[field], str) or not event[field].strip():
+                errors.append(f"{field} must be a non-empty string")
+        for field in ("thread_id", "gateway_profile"):
+            if event[field] is not None and not isinstance(event[field], str):
+                errors.append(f"{field} must be a string or null")
+        _validate_provider_ids(event, errors)
+    return {"ok": not errors, "errors": errors}
+
+
+def _validate_provider_ids(event: dict[str, Any], errors: list[str]) -> None:
     provider_ids = event["provider_message_ids"]
     if not isinstance(provider_ids, list) or not provider_ids or any(
         not isinstance(value, str) or not value for value in provider_ids
@@ -123,9 +208,6 @@ def validate_event(event: dict[str, Any]) -> dict[str, Any]:
         or event["canonical_parent_message_id"] not in provider_ids
     ):
         errors.append("canonical_parent_message_id must identify a provider message")
-    if event["actual_session_id"] is not None:
-        errors.append("delivery actual_session_id must remain unresolved")
-    return {"ok": not errors, "errors": errors}
 
 
 def build_delivery_event(
@@ -159,25 +241,192 @@ def build_delivery_event(
     return event
 
 
+def build_inbound_event(
+    *,
+    provider_event_id: str,
+    parent_message_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str | None,
+    sender_id: str,
+    gateway_profile: str | None,
+    actual_session_id: str,
+    actual_session_key: str,
+    gateway_revision: str | None = None,
+) -> dict[str, Any]:
+    """Build a redacted native inbound event after session resolution."""
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "event_type": "inbound",
+        "event_version": EVENT_VERSION,
+        "occurred_at": time.time(),
+        "provider_event_id": provider_event_id,
+        "parent_message_id": parent_message_id,
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "sender_id": sender_id,
+        "gateway_profile": gateway_profile,
+        "actual_session_id": actual_session_id,
+        "actual_session_key": actual_session_key,
+    }
+    if gateway_revision:
+        event["gateway_revision"] = gateway_revision
+    return event
+
+
+def build_outbound_event(
+    *,
+    inbound_event_id: str,
+    message_id: str | None,
+    continuation_message_ids: tuple | list = (),
+    platform: str,
+    chat_id: str,
+    thread_id: str | None,
+    gateway_profile: str | None,
+    actual_session_id: str,
+    actual_session_key: str,
+    gateway_revision: str | None = None,
+) -> dict[str, Any]:
+    """Build a redacted native outbound receipt causally tied to an inbound event."""
+    provider_ids = [str(value) for value in continuation_message_ids if value]
+    if message_id and str(message_id) not in provider_ids:
+        provider_ids.append(str(message_id))
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "event_type": "outbound",
+        "event_version": EVENT_VERSION,
+        "occurred_at": time.time(),
+        "provider_message_ids": provider_ids,
+        "canonical_parent_message_id": str(message_id) if message_id else None,
+        "causal_inbound_event_id": inbound_event_id,
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "gateway_profile": gateway_profile,
+        "actual_session_id": actual_session_id,
+        "actual_session_key": actual_session_key,
+    }
+    if gateway_revision:
+        event["gateway_revision"] = gateway_revision
+    return event
+
+
+def record_inbound_from_event(
+    message_event: Any,
+    *,
+    actual_session_id: str,
+    actual_session_key: str,
+) -> dict[str, Any]:
+    """Persist an exact native reply after Hermes has resolved its session.
+
+    The caller deliberately supplies the resolved session values from the
+    gateway's normal session store.  This helper never constructs or predicts a
+    session identity from a transport event.
+    """
+    source = getattr(message_event, "source", None)
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    provider_event_id = getattr(message_event, "message_id", None)
+    parent_message_id = getattr(message_event, "reply_to_message_id", None)
+    sender_id = getattr(source, "user_id", None)
+    chat_id = getattr(source, "chat_id", None)
+    if not all((platform, provider_event_id, parent_message_id, sender_id, chat_id)):
+        return {"ok": False, "skipped": "not_an_exact_native_reply"}
+    if not lifecycle_observer_enabled():
+        return {"ok": False, "skipped": "no_lifecycle_observer"}
+    event = build_inbound_event(
+        provider_event_id=str(provider_event_id),
+        parent_message_id=str(parent_message_id),
+        platform=str(platform),
+        chat_id=str(chat_id),
+        thread_id=(str(source.thread_id) if getattr(source, "thread_id", None) is not None else None),
+        sender_id=str(sender_id),
+        gateway_profile=(str(source.profile) if getattr(source, "profile", None) is not None else None),
+        actual_session_id=str(actual_session_id),
+        actual_session_key=str(actual_session_key),
+    )
+    result = enqueue_and_notify(event)
+    if result.get("ok"):
+        metadata = getattr(message_event, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata["gateway_lifecycle_inbound_event_id"] = result["event_id"]
+            metadata["gateway_lifecycle_actual_session_id"] = str(actual_session_id)
+            metadata["gateway_lifecycle_actual_session_key"] = str(actual_session_key)
+    return result
+
+
+def record_outbound_from_result(message_event: Any, send_result: Any) -> dict[str, Any]:
+    """Persist an outbound receipt only for a lifecycle-marked native reply."""
+    metadata = getattr(message_event, "metadata", None)
+    source = getattr(message_event, "source", None)
+    if not isinstance(metadata, dict) or source is None:
+        return {"ok": False, "skipped": "no_lifecycle_context"}
+    inbound_event_id = metadata.get("gateway_lifecycle_inbound_event_id")
+    actual_session_id = metadata.get("gateway_lifecycle_actual_session_id")
+    actual_session_key = metadata.get("gateway_lifecycle_actual_session_key")
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    chat_id = getattr(source, "chat_id", None)
+    message_id = getattr(send_result, "message_id", None)
+    if not (
+        getattr(send_result, "success", False)
+        and inbound_event_id
+        and actual_session_id
+        and actual_session_key
+        and platform
+        and chat_id
+        and message_id
+    ):
+        return {"ok": False, "skipped": "no_authoritative_outbound_receipt"}
+    return enqueue_and_notify(
+        build_outbound_event(
+            inbound_event_id=str(inbound_event_id),
+            message_id=str(message_id),
+            continuation_message_ids=getattr(send_result, "continuation_message_ids", ()) or (),
+            platform=str(platform),
+            chat_id=str(chat_id),
+            thread_id=(str(source.thread_id) if getattr(source, "thread_id", None) is not None else None),
+            gateway_profile=(str(source.profile) if getattr(source, "profile", None) is not None else None),
+            actual_session_id=str(actual_session_id),
+            actual_session_key=str(actual_session_key),
+        )
+    )
+
+
+def _dedupe_key(event: dict[str, Any]) -> str:
+    """Return a deterministic provider-identity key without adding it to receipts."""
+    if event["event_type"] == "delivery":
+        return ":".join(
+            ("delivery", event["dispatch_id"], event["activation_attempt_id"], event["canonical_parent_message_id"])
+        )
+    if event["event_type"] == "inbound":
+        return ":".join(
+            ("inbound", event["platform"], event["gateway_profile"] or "", event["chat_id"], event["provider_event_id"])
+        )
+    return ":".join(
+        ("outbound", event["platform"], event["gateway_profile"] or "", event["chat_id"], event["canonical_parent_message_id"], event["causal_inbound_event_id"])
+    )
+
+
 def enqueue(event: dict[str, Any]) -> dict[str, Any]:
     """Persist an event before any plugin notification is attempted."""
     validation = validate_event(event)
     if not validation["ok"]:
         return validation
     payload = json.dumps(event, sort_keys=True, separators=(",", ":"))
+    dedupe_key = _dedupe_key(event)
     now = time.time()
     with _transaction() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO gateway_lifecycle_events
-               (event_id, payload_json, state, attempts, leased_at, created_at, updated_at)
-               VALUES (?, ?, 'pending', 0, NULL, ?, ?)""",
-            (event["event_id"], payload, now, now),
+               (event_id, dedupe_key, payload_json, state, attempts, leased_at, created_at, updated_at)
+               VALUES (?, ?, ?, 'pending', 0, NULL, ?, ?)""",
+            (event["event_id"], dedupe_key, payload, now, now),
         )
         row = conn.execute(
-            "SELECT state FROM gateway_lifecycle_events WHERE event_id=?",
-            (event["event_id"],),
+            "SELECT event_id, state FROM gateway_lifecycle_events WHERE dedupe_key=?",
+            (dedupe_key,),
         ).fetchone()
-    return {"ok": True, "event_id": event["event_id"], "state": row[0]}
+    return {"ok": True, "event_id": row[0], "state": row[1]}
 
 
 def drain(notify: Callable[[dict[str, Any]], bool]) -> int:
@@ -238,6 +487,13 @@ def notify_plugins(event: dict[str, Any]) -> bool:
         "gateway_lifecycle_event", event=event
     )
     return accepted
+
+
+def lifecycle_observer_enabled() -> bool:
+    """Return whether a native lifecycle observer is explicitly installed."""
+    from hermes_cli.plugins import get_plugin_manager
+
+    return get_plugin_manager().has_hook("gateway_lifecycle_event")
 
 
 def enqueue_and_notify(event: dict[str, Any]) -> dict[str, Any]:

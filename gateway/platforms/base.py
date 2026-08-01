@@ -6070,6 +6070,17 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    # Native reply lifecycle evidence is intentionally
+                    # observational.  The runner stamped its resolved native
+                    # session onto this event after normal session resolution;
+                    # this emits a durable receipt only when the transport
+                    # returned an authoritative provider message ID.
+                    try:
+                        from gateway.lifecycle_events import record_outbound_from_result
+
+                        record_outbound_from_result(event, result)
+                    except Exception:
+                        logger.debug("gateway lifecycle outbound receipt failed", exc_info=True)
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
