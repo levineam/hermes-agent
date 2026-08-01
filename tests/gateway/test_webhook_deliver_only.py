@@ -26,6 +26,10 @@ from gateway.platforms.base import MessageEvent, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 
 
+_DISPATCH_ID = "a" * 64
+_ATTEMPT_ID = "b" * 64
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -155,7 +159,7 @@ class TestDeliverOnlyBypassesAgent:
             async with TestClient(TestServer(app)) as cli:
                 response = await cli.post(
                     "/webhooks/morning",
-                    json={"dispatch_id": "dispatch-1", "activation_attempt_id": "attempt-1"},
+                    json={"dispatch_id": _DISPATCH_ID, "activation_attempt_id": _ATTEMPT_ID},
                     headers={"X-GitHub-Delivery": "morning-1"},
                 )
 
@@ -163,11 +167,44 @@ class TestDeliverOnlyBypassesAgent:
         assert len(captured) == 1
         event = captured[0]
         assert event["event_type"] == "delivery"
-        assert event["dispatch_id"] == "dispatch-1"
+        assert event["dispatch_id"] == _DISPATCH_ID
         assert event["provider_message_ids"] == ["telegram-1", "telegram-2"]
         assert event["canonical_parent_message_id"] == "telegram-2"
         assert event["actual_session_id"] is None
         assert "content" not in event
+
+    @pytest.mark.asyncio
+    async def test_rejects_secret_like_lifecycle_correlation_before_send(self):
+        routes = {
+            "morning": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "12345"},
+                "prompt": "good morning",
+                "lifecycle": {
+                    "route_revision": "route-r1",
+                    "destination_revision": "destination-r1",
+                    "plugin_revision": "plugin-r1",
+                    "expected_conversation_key": "agent:main:telegram:dm:12345",
+                    "dispatch_id_field": "dispatch_id",
+                    "activation_attempt_id_field": "activation_attempt_id",
+                },
+            }
+        }
+        adapter = _make_adapter(routes)
+        target = _wire_mock_target(adapter)
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/morning",
+                json={"dispatch_id": "canary-secret-abc", "activation_attempt_id": _ATTEMPT_ID},
+                headers={"X-GitHub-Delivery": "morning-1"},
+            )
+
+        assert response.status == 400
+        target.send.assert_not_awaited()
 
 
 # ===================================================================

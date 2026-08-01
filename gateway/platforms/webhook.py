@@ -179,6 +179,13 @@ def _route_lifecycle_correlation(route: dict, payload: dict | None = None) -> di
     if any(not isinstance(value, str) or not value.strip()
            for value in correlation.values()):
         raise ValueError("lifecycle request correlation is missing")
+    if any(
+        not lifecycle_events.is_opaque_correlation_id(correlation[field])
+        for field in ("dispatch_id", "activation_attempt_id")
+    ):
+        raise ValueError(
+            "lifecycle request correlation IDs must be 64-character lowercase hexadecimal digests"
+        )
     return correlation
 
 
@@ -904,6 +911,26 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
         )
 
+        lifecycle_correlation = None
+        if route_config.get("deliver_only"):
+            try:
+                _validate_lifecycle_route(route_config)
+                lifecycle_correlation = _route_lifecycle_correlation(route_config, payload)
+            except ValueError as exc:
+                logger.warning(
+                    "[webhook] refusing direct delivery with invalid lifecycle correlation route=%s: %s",
+                    route_name,
+                    exc,
+                )
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "Invalid lifecycle correlation",
+                        "delivery_id": delivery_id,
+                    },
+                    status=400,
+                )
+
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
@@ -923,18 +950,6 @@ class WebhookAdapter(BasePlatformAdapter):
         # to a user's chat with zero LLM cost.  Reuses the same HMAC auth,
         # rate limiting, idempotency, and template rendering as agent mode.
         if route_config.get("deliver_only"):
-            try:
-                _validate_lifecycle_route(route_config)
-            except ValueError as exc:
-                logger.error(
-                    "[webhook] refusing direct delivery with invalid lifecycle route=%s: %s",
-                    route_name,
-                    exc,
-                )
-                return web.json_response(
-                    {"status": "error", "error": "Invalid lifecycle configuration", "delivery_id": delivery_id},
-                    status=500,
-                )
             delivery = {
                 "deliver": route_config.get("deliver", "log"),
                 "deliver_extra": self._render_delivery_extra(
@@ -961,13 +976,12 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
                     status=502,
-                )
+            )
 
             if result.success:
-                correlation = _route_lifecycle_correlation(route_config, payload)
-                if correlation is not None:
+                if lifecycle_correlation is not None:
                     event = lifecycle_events.build_delivery_event(
-                        correlation=correlation,
+                        correlation=lifecycle_correlation,
                         message_id=result.message_id,
                         continuation_message_ids=result.continuation_message_ids,
                     )

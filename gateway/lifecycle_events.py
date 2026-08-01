@@ -10,6 +10,7 @@ and arbitrary plugin data are not lifecycle evidence.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -75,6 +76,19 @@ _ALLOWED_FIELDS_BY_TYPE = {
     "outbound": _COMMON_REQUIRED_FIELDS | _OUTBOUND_REQUIRED_FIELDS | frozenset({"gateway_revision"}),
 }
 _LEASE_SECONDS = 60
+
+
+def is_opaque_correlation_id(value: Any) -> bool:
+    """Return true only for a fixed-format digest safe to persist as an ID.
+
+    Lifecycle correlation comes from an authenticated request body, but it is
+    still untrusted input.  Requiring an exact SHA-256 hex digest prevents a
+    raw prompt, credential, or provider error from being relabeled as an ID
+    and copied into the durable outbox or an observer plugin.
+    """
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(char in "0123456789abcdef" for char in value)
 
 
 def _db_path():
@@ -160,6 +174,9 @@ def validate_event(event: dict[str, Any]) -> dict[str, Any]:
         ):
             if not isinstance(event[field], str) or not event[field].strip():
                 errors.append(f"{field} must be a non-empty string")
+        for field in ("dispatch_id", "activation_attempt_id"):
+            if not is_opaque_correlation_id(event[field]):
+                errors.append(f"{field} must be a 64-character lowercase hexadecimal digest")
         _validate_provider_ids(event, errors)
         if event["actual_session_id"] is not None:
             errors.append("delivery actual_session_id must remain unresolved")
@@ -393,18 +410,38 @@ def record_outbound_from_result(message_event: Any, send_result: Any) -> dict[st
 
 
 def _dedupe_key(event: dict[str, Any]) -> str:
-    """Return a deterministic provider-identity key without adding it to receipts."""
+    """Return a deterministic, unambiguous provider-identity key.
+
+    The key is an internal index only.  Canonical JSON prevents delimiter
+    ambiguity between provider identifiers, and hashing keeps the SQLite index
+    bounded without adding an internal field to a signed receipt payload.
+    """
     if event["event_type"] == "delivery":
-        return ":".join(
-            ("delivery", event["dispatch_id"], event["activation_attempt_id"], event["canonical_parent_message_id"])
+        identity = (
+            event["event_type"],
+            event["dispatch_id"],
+            event["activation_attempt_id"],
+            event["canonical_parent_message_id"],
         )
-    if event["event_type"] == "inbound":
-        return ":".join(
-            ("inbound", event["platform"], event["gateway_profile"] or "", event["chat_id"], event["provider_event_id"])
+    elif event["event_type"] == "inbound":
+        identity = (
+            event["event_type"],
+            event["platform"],
+            event["gateway_profile"],
+            event["chat_id"],
+            event["provider_event_id"],
         )
-    return ":".join(
-        ("outbound", event["platform"], event["gateway_profile"] or "", event["chat_id"], event["canonical_parent_message_id"], event["causal_inbound_event_id"])
-    )
+    else:
+        identity = (
+            event["event_type"],
+            event["platform"],
+            event["gateway_profile"],
+            event["chat_id"],
+            event["canonical_parent_message_id"],
+            event["causal_inbound_event_id"],
+        )
+    encoded = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def enqueue(event: dict[str, Any]) -> dict[str, Any]:

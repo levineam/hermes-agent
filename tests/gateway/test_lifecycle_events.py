@@ -7,10 +7,14 @@ from types import SimpleNamespace
 from gateway import lifecycle_events as events
 
 
+_DISPATCH_ID = "a" * 64
+_ATTEMPT_ID = "b" * 64
+
+
 def _correlation():
     return {
-        "dispatch_id": "dispatch-1",
-        "activation_attempt_id": "attempt-1",
+        "dispatch_id": _DISPATCH_ID,
+        "activation_attempt_id": _ATTEMPT_ID,
         "route_revision": "route-r1",
         "destination_revision": "destination-r1",
         "plugin_revision": "plugin-r1",
@@ -43,6 +47,16 @@ def test_rejects_unknown_or_raw_content_fields():
 
     assert result["ok"] is False
     assert "unknown field: content" in result["errors"]
+
+
+def test_rejects_raw_or_secret_like_correlation_values():
+    event = _event()
+    event["dispatch_id"] = "canary-secret-abc"
+
+    result = events.validate_event(event)
+
+    assert result["ok"] is False
+    assert "dispatch_id must be a 64-character lowercase hexadecimal digest" in result["errors"]
 
 
 def test_inbound_event_has_native_session_identity_but_no_raw_reply():
@@ -187,3 +201,22 @@ def test_inbound_provider_event_is_deduplicated_across_restarts(tmp_path, monkey
     duplicate_result = events.enqueue(duplicate)
 
     assert duplicate_result["event_id"] == first_result["event_id"]
+
+
+def test_dedupe_key_distinguishes_colon_containing_provider_identities():
+    common = {
+        "inbound_event_id": "inbound-event-1",
+        "message_id": "provider-id",
+        "continuation_message_ids": (),
+        "platform": "telegram",
+        "thread_id": None,
+        "gateway_profile": None,
+        "actual_session_id": "session-1",
+        "actual_session_key": "agent:main:telegram:dm:chat-1",
+    }
+    first = events.build_outbound_event(chat_id="a:b", **common)
+    second = events.build_outbound_event(chat_id="a", message_id="b:c", **{
+        key: value for key, value in common.items() if key != "message_id"
+    })
+
+    assert events._dedupe_key(first) != events._dedupe_key(second)
