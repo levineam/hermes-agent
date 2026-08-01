@@ -308,6 +308,28 @@ class TestPluginHooks:
 
 
 
+    def test_lifecycle_event_hook_reports_callback_failures_for_replay(self):
+        mgr = PluginManager()
+        seen = []
+
+        def _broken(**_kwargs):
+            raise RuntimeError("temporary bridge failure")
+
+        def _healthy(**kwargs):
+            seen.append(kwargs["event"]["event_id"])
+            return "accepted"
+
+        mgr._hooks["gateway_lifecycle_event"] = [_broken, _healthy]
+
+        results, accepted = mgr.invoke_hook_with_status(
+            "gateway_lifecycle_event", event={"event_id": "event-1"}
+        )
+
+        assert "gateway_lifecycle_event" in VALID_HOOKS
+        assert results == ["accepted"]
+        assert accepted is False
+        assert seen == ["event-1"]
+
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
         """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"

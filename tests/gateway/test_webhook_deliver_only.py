@@ -119,6 +119,56 @@ class TestDeliverOnlyBypassesAgent:
         assert chat_id_arg == "12345"
         assert content_arg == "alice matched with bob!"
 
+    @pytest.mark.asyncio
+    async def test_emits_redacted_provider_receipt_for_fixed_lifecycle_route(self):
+        routes = {
+            "morning": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "12345"},
+                "prompt": "good morning",
+                "lifecycle": {
+                    "route_revision": "route-r1",
+                    "destination_revision": "destination-r1",
+                    "plugin_revision": "plugin-r1",
+                    "expected_conversation_key": "agent:main:telegram:dm:12345",
+                    "dispatch_id_field": "dispatch_id",
+                    "activation_attempt_id_field": "activation_attempt_id",
+                },
+            }
+        }
+        adapter = _make_adapter(routes)
+        target = _wire_mock_target(adapter)
+        target.send = AsyncMock(return_value=SendResult(
+            success=True,
+            message_id="telegram-2",
+            continuation_message_ids=("telegram-1",),
+        ))
+        captured = []
+
+        app = _create_app(adapter)
+        with patch(
+            "gateway.platforms.webhook.lifecycle_events.enqueue_and_notify",
+            side_effect=lambda event: captured.append(event) or {"ok": True},
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/webhooks/morning",
+                    json={"dispatch_id": "dispatch-1", "activation_attempt_id": "attempt-1"},
+                    headers={"X-GitHub-Delivery": "morning-1"},
+                )
+
+        assert response.status == 200
+        assert len(captured) == 1
+        event = captured[0]
+        assert event["event_type"] == "delivery"
+        assert event["dispatch_id"] == "dispatch-1"
+        assert event["provider_message_ids"] == ["telegram-1", "telegram-2"]
+        assert event["canonical_parent_message_id"] == "telegram-2"
+        assert event["actual_session_id"] is None
+        assert "content" not in event
+
 
 # ===================================================================
 # HTTP status codes
@@ -187,6 +237,22 @@ class TestDeliverOnlyStartupValidation:
                 await adapter.disconnect()
         except ValueError:
             pytest.fail("valid deliver_only config should not raise ValueError")
+
+    @pytest.mark.asyncio
+    async def test_rejects_partial_lifecycle_metadata_before_binding(self):
+        adapter = _make_adapter({
+            "bad": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "c-1"},
+                "prompt": "hi",
+                "lifecycle": {"dispatch_id_field": "dispatch_id"},
+            }
+        })
+
+        with pytest.raises(ValueError, match="invalid lifecycle metadata"):
+            await adapter.connect()
 
 
 # ===================================================================

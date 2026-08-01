@@ -171,6 +171,10 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Durable, redacted provider receipt emitted by the gateway lifecycle
+    # outbox. Observers receive an allowlisted event with correlation and
+    # delivery IDs only; they cannot influence provider delivery.
+    "gateway_lifecycle_event",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -1928,22 +1932,35 @@ class PluginManager:
         are reused.  All injected context is ephemeral — never
         persisted to session DB.
         """
+        results, _ = self.invoke_hook_with_status(hook_name, **kwargs)
+        return results
+
+    def invoke_hook_with_status(self, hook_name: str, **kwargs: Any) -> tuple[List[Any], bool]:
+        """Invoke observer hooks and report whether every callback accepted.
+
+        Ordinary lifecycle hooks preserve their historic best-effort API via
+        :meth:`invoke_hook`. The gateway receipt outbox additionally needs to
+        retain an event for replay when an observer throws, without allowing a
+        plugin failure to alter the already-completed provider send.
+        """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
+        accepted = True
         for cb in callbacks:
             try:
                 ret = cb(**kwargs)
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                accepted = False
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
-        return results
+        return results, accepted
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
@@ -2071,6 +2088,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_hook_with_status(hook_name: str, **kwargs: Any) -> tuple[List[Any], bool]:
+    """Invoke observer hooks and retain callback-failure status for outboxes."""
+    return get_plugin_manager().invoke_hook_with_status(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

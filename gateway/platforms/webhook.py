@@ -17,6 +17,10 @@ Each route defines:
     message that gets delivered.  Use for external push notifications
     (Supabase, monitoring alerts, inter-agent pings) where zero LLM cost
     and sub-second delivery matter more than agent reasoning.
+  - lifecycle: optional fixed correlation/revision metadata. When present on a
+    deliver_only route, Hermes records a redacted provider receipt and notifies
+    opt-in lifecycle plugins without allowing the request to select a route,
+    target, credential, or plugin.
 
 Security:
   - HMAC secret is required per route (validated at startup)
@@ -53,6 +57,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway import lifecycle_events
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -107,6 +112,74 @@ _BUILTIN_DELIVER_PLATFORMS = {
     "feishu", "wecom", "wecom_callback", "weixin", "bluebubbles",
     "qqbot", "yuanbao",
 }
+
+_LIFECYCLE_CORRELATION_FIELDS = frozenset(
+    {
+        "route_revision",
+        "destination_revision",
+        "plugin_revision",
+        "expected_conversation_key",
+        "dispatch_id_field",
+        "activation_attempt_id_field",
+    }
+)
+
+_LIFECYCLE_FIXED_FIELDS = frozenset(
+    {
+        "route_revision",
+        "destination_revision",
+        "plugin_revision",
+        "expected_conversation_key",
+    }
+)
+_LIFECYCLE_REQUEST_FIELD_NAMES = frozenset(
+    {"dispatch_id_field", "activation_attempt_id_field"}
+)
+
+
+def _route_lifecycle_correlation(route: dict, payload: dict | None = None) -> dict | None:
+    """Return fixed, operator-configured lifecycle metadata for a route.
+
+    Route, destination, plugin, and expected-session revisions are fixed in
+    operator configuration. Only dispatch and activation-attempt identifiers
+    come from named fields in the already-authenticated request body; they are
+    correlation evidence, never delivery controls.
+    """
+    lifecycle = route.get("lifecycle")
+    if lifecycle is None:
+        return None
+    if not isinstance(lifecycle, dict):
+        raise ValueError("lifecycle must be an object")
+    unknown = sorted(set(lifecycle) - _LIFECYCLE_CORRELATION_FIELDS)
+    missing = sorted(_LIFECYCLE_CORRELATION_FIELDS - set(lifecycle))
+    if unknown or missing or any(
+        not isinstance(lifecycle.get(field), str) or not lifecycle[field].strip()
+        for field in _LIFECYCLE_CORRELATION_FIELDS
+    ):
+        details = []
+        if unknown:
+            details.append(f"unknown fields: {', '.join(unknown)}")
+        if missing:
+            details.append(f"missing fields: {', '.join(missing)}")
+        if not details:
+            details.append("every field must be a non-empty string")
+        raise ValueError("invalid lifecycle metadata (" + "; ".join(details) + ")")
+    if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", lifecycle[field])
+           for field in _LIFECYCLE_REQUEST_FIELD_NAMES):
+        raise ValueError("invalid lifecycle request field name")
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError("lifecycle request body must be an object")
+    correlation = {field: lifecycle[field] for field in _LIFECYCLE_FIXED_FIELDS}
+    correlation["dispatch_id"] = payload.get(lifecycle["dispatch_id_field"])
+    correlation["activation_attempt_id"] = payload.get(
+        lifecycle["activation_attempt_id_field"]
+    )
+    if any(not isinstance(value, str) or not value.strip()
+           for value in correlation.values()):
+        raise ValueError("lifecycle request correlation is missing")
+    return correlation
 
 # Default bind host. ``None`` tells aiohttp/asyncio's ``create_server`` to bind
 # BOTH address families (IPv4 + IPv6) — the portable dual-stack default.
@@ -282,6 +355,18 @@ class WebhookAdapter(BasePlatformAdapter):
                         f"deliver is '{deliver}'. Direct delivery requires a "
                         f"real target (telegram, discord, slack, github_comment, etc.)."
                     )
+                if route.get("lifecycle") is not None:
+                    try:
+                        _route_lifecycle_correlation(route)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"[webhook] Route '{name}' has {exc}"
+                        ) from exc
+
+        # Drain lifecycle evidence before accepting new requests. This only
+        # replays plugin notifications; it never repeats a provider send.
+        if any(route.get("lifecycle") is not None for route in self._routes.values()):
+            lifecycle_events.drain(lifecycle_events.notify_plugins)
 
         # client_max_size makes aiohttp enforce the cap on every read path,
         # including Transfer-Encoding: chunked bodies that carry no
@@ -847,6 +932,21 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
             if result.success:
+                correlation = _route_lifecycle_correlation(route_config, payload)
+                if correlation is not None:
+                    event = lifecycle_events.build_delivery_event(
+                        correlation=correlation,
+                        message_id=result.message_id,
+                        continuation_message_ids=result.continuation_message_ids,
+                    )
+                    queued = lifecycle_events.enqueue_and_notify(event)
+                    if not queued.get("ok"):
+                        logger.error(
+                            "[webhook] lifecycle receipt rejected route=%s delivery=%s errors=%s",
+                            route_name,
+                            delivery_id,
+                            queued.get("errors"),
+                        )
                 return web.json_response(
                     {
                         "status": "delivered",
