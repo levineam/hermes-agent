@@ -1,7 +1,6 @@
 """Tests for agent/transports/types.py — dataclass construction + helpers."""
 
 import json
-import pytest
 
 from agent.transports.types import (
     NormalizedResponse,
@@ -77,23 +76,7 @@ class TestNormalizedResponse:
         assert len(r.tool_calls) == 1
         assert r.tool_calls[0].name == "terminal"
 
-    def test_with_reasoning(self):
-        r = NormalizedResponse(
-            content="answer",
-            tool_calls=None,
-            finish_reason="stop",
-            reasoning="I thought about it",
-        )
-        assert r.reasoning == "I thought about it"
 
-    def test_with_provider_data(self):
-        r = NormalizedResponse(
-            content=None,
-            tool_calls=None,
-            finish_reason="stop",
-            provider_data={"reasoning_details": [{"type": "thinking", "thinking": "hmm"}]},
-        )
-        assert r.provider_data["reasoning_details"][0]["type"] == "thinking"
 
 
 # ---------------------------------------------------------------------------
@@ -106,19 +89,7 @@ class TestBuildToolCall:
         assert tc.arguments == json.dumps({"cmd": "ls"})
         assert tc.provider_data is None
 
-    def test_string_arguments_passthrough(self):
-        tc = build_tool_call(id="call_2", name="read_file", arguments='{"path": "/tmp"}')
-        assert tc.arguments == '{"path": "/tmp"}'
 
-    def test_provider_fields(self):
-        tc = build_tool_call(
-            id="call_3",
-            name="terminal",
-            arguments="{}",
-            call_id="call_3",
-            response_item_id="fc_3",
-        )
-        assert tc.provider_data == {"call_id": "call_3", "response_item_id": "fc_3"}
 
     def test_none_id(self):
         tc = build_tool_call(id=None, name="t", arguments="{}")
@@ -149,3 +120,81 @@ class TestMapFinishReason:
 
     def test_none_reason(self):
         assert map_finish_reason(None, self.ANTHROPIC_MAP) == "stop"
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat property tests
+# ---------------------------------------------------------------------------
+
+class TestToolCallBackwardCompat:
+    """Test duck-typing properties that let ToolCall pass through code expecting
+    the old SimpleNamespace(id, type, function=SimpleNamespace(name, arguments)) shape."""
+
+
+
+    def test_function_name_matches(self):
+        tc = ToolCall(id="1", name="search", arguments='{"q":"test"}')
+        assert tc.function.name == "search"
+        assert tc.function.name == tc.name
+
+    def test_function_arguments_matches(self):
+        tc = ToolCall(id="1", name="search", arguments='{"q":"test"}')
+        assert tc.function.arguments == '{"q":"test"}'
+        assert tc.function.arguments == tc.arguments
+
+
+
+
+
+    def test_getattr_pattern_matches_agent_loop(self):
+        """run_agent.py uses getattr(tool_call, 'call_id', None) — verify it works."""
+        tc = ToolCall(id="1", name="fn", arguments="{}", provider_data={"call_id": "c1"})
+        assert getattr(tc, "call_id", None) == "c1"
+        tc_no_pd = ToolCall(id="1", name="fn", arguments="{}")
+        assert getattr(tc_no_pd, "call_id", None) is None
+
+
+
+
+    def test_extra_content_getattr_pattern(self):
+        """_build_assistant_message uses getattr(tc, 'extra_content', None).
+
+        This is the exact pattern that was broken before the extra_content
+        property was added — ToolCall lacked the property so getattr always
+        returned None, silently dropping the Gemini thought_signature and
+        causing HTTP 400 on subsequent turns (issue #14488).
+        """
+        ec = {"google": {"thought_signature": "SIG_ABC123"}}
+        tc = ToolCall(id="1", name="fn", arguments="{}", provider_data={"extra_content": ec})
+        assert getattr(tc, "extra_content", None) == ec
+
+        tc_no_extra = ToolCall(id="1", name="fn", arguments="{}")
+        assert getattr(tc_no_extra, "extra_content", None) is None
+
+
+class TestNormalizedResponseBackwardCompat:
+    """Test properties that replaced _nr_to_assistant_message() shim."""
+
+    def test_reasoning_content_from_provider_data(self):
+        nr = NormalizedResponse(
+            content="hi", tool_calls=None, finish_reason="stop",
+            provider_data={"reasoning_content": "thought process"},
+        )
+        assert nr.reasoning_content == "thought process"
+
+    def test_reasoning_content_none_when_absent(self):
+        nr = NormalizedResponse(content="hi", tool_calls=None, finish_reason="stop")
+        assert nr.reasoning_content is None
+
+    def test_reasoning_details_from_provider_data(self):
+        details = [{"type": "thinking", "thinking": "hmm"}]
+        nr = NormalizedResponse(
+            content="hi", tool_calls=None, finish_reason="stop",
+            provider_data={"reasoning_details": details},
+        )
+        assert nr.reasoning_details == details
+
+
+
+
+

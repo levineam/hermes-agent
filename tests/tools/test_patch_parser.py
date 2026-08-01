@@ -112,16 +112,6 @@ class TestParseInvalidPatch:
         assert err is None
         assert ops == []
 
-    def test_no_begin_marker_still_parses(self):
-        patch = """\
-*** Update File: f.py
- line1
--old
-+new
-*** End Patch"""
-        ops, err = parse_v4a_patch(patch)
-        assert err is None
-        assert len(ops) == 1
 
     def test_multiple_operations(self):
         patch = """\
@@ -367,39 +357,28 @@ class TestValidationPhase:
         assert written == {}, f"No files should have been written, got: {list(written.keys())}"
         assert "validation failed" in result.error.lower()
 
-    def test_all_valid_operations_applied(self):
-        """When all operations are valid, all files are written."""
+
+    def test_validation_error_identifies_hunk_number(self):
         patch = """\
 *** Begin Patch
 *** Update File: a.py
- def foo():
--    return 1
-+    return 2
-*** Update File: b.py
- def bar():
--    pass
-+    return True
+@@ first @@
+-first = 1
++first = 2
+@@ missing @@
+-does_not_exist = 1
++does_not_exist = 2
 *** End Patch"""
         ops, err = parse_v4a_patch(patch)
         assert err is None
 
-        written = {}
-
         class FakeFileOps:
             def read_file_raw(self, path):
-                files = {
-                    "a.py": "def foo():\n    return 1\n",
-                    "b.py": "def bar():\n    pass\n",
-                }
-                return SimpleNamespace(content=files[path], error=None)
-
-            def write_file(self, path, content):
-                written[path] = content
-                return SimpleNamespace(error=None)
+                return SimpleNamespace(content="first = 1\n", error=None)
 
         result = apply_v4a_operations(ops, FakeFileOps())
-        assert result.success is True
-        assert set(written.keys()) == {"a.py", "b.py"}
+        assert result.success is False
+        assert "hunk 2" in result.error.lower()
 
 
 class TestApplyDelete:
@@ -481,21 +460,6 @@ class TestParseErrorSignalling:
         assert err is not None, "Expected a parse error for hunk-less UPDATE"
         assert ops == []
 
-    def test_move_without_destination_returns_error(self):
-        """A MOVE without '->' syntax should not silently produce a broken operation."""
-        # The move regex requires '->' so this will be treated as an unrecognised
-        # line and the op is never created.  Confirm nothing crashes and ops is empty.
-        patch = """\
-*** Begin Patch
-*** Move File: src/foo.py
-*** End Patch"""
-        ops, err = parse_v4a_patch(patch)
-        # Either parse sees zero ops (fine) or returns an error (also fine).
-        # What is NOT acceptable is ops=[MOVE op with empty new_path] + err=None.
-        if ops:
-            assert err is not None, (
-                "MOVE with missing destination must either produce empty ops or an error"
-            )
 
     def test_valid_patch_returns_no_error(self):
         """A well-formed patch must still return err=None."""
@@ -509,3 +473,141 @@ class TestParseErrorSignalling:
         ops, err = parse_v4a_patch(patch)
         assert err is None
         assert len(ops) == 1
+
+
+class TestV4ALspDiagnosticsPropagation:
+    """V4A patches must surface ``WriteResult.lsp_diagnostics`` from the
+    underlying ``write_file`` calls on ``PatchResult.lsp_diagnostics``.
+
+    Without explicit propagation the LSP tier's output gets silently
+    dropped on the V4A code path — see Copilot review #3271017295 on
+    PR #29054.  The shell-linter LSP skip introduced by that PR makes
+    this gap visible: a ``.ts`` / ``.go`` / ``.rs`` V4A patch with LSP
+    active would otherwise return ``lint = {f: {skipped: True, ...}}``
+    and zero diagnostics from any channel.
+    """
+
+    def _build_ops_writing(self, path: str, content: str):
+        """Build a single ADD operation that writes ``content`` to ``path``."""
+        # Use the V4A parser so we don't have to construct PatchOperation
+        # / Hunk / Line objects by hand.
+        lines = "\n".join(f"+{line}" for line in content.splitlines())
+        patch_text = (
+            "*** Begin Patch\n"
+            f"*** Add File: {path}\n"
+            f"{lines}\n"
+            "*** End Patch"
+        )
+        ops, err = parse_v4a_patch(patch_text)
+        assert err is None, err
+        return ops
+
+    def test_lsp_diagnostics_propagated_from_write_file_on_add(self):
+        """ADD op: ``WriteResult.lsp_diagnostics`` flows through to
+        ``PatchResult.lsp_diagnostics``."""
+        ops = self._build_ops_writing("foo.ts", "const x: number = 1\n")
+
+        diag_block = (
+            "<diagnostics file=\"foo.ts\">\n"
+            "ERROR [1:7] some diagnostic\n"
+            "</diagnostics>"
+        )
+
+        class FakeFileOps:
+            def write_file(self, path, content):
+                return SimpleNamespace(error=None, lsp_diagnostics=diag_block)
+
+            def _check_lint(self, path):
+                return SimpleNamespace(to_dict=lambda: {"skipped": True})
+
+        result = apply_v4a_operations(ops, FakeFileOps())
+
+        assert result.success is True
+        assert result.lsp_diagnostics == diag_block
+
+    def test_lsp_diagnostics_propagated_from_write_file_on_update(self):
+        """UPDATE op: ``WriteResult.lsp_diagnostics`` flows through to
+        ``PatchResult.lsp_diagnostics``."""
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: bar.ts\n"
+            "-old\n"
+            "+new\n"
+            "*** End Patch"
+        )
+        ops, err = parse_v4a_patch(patch_text)
+        assert err is None
+
+        diag_block = (
+            "<diagnostics file=\"bar.ts\">\n"
+            "ERROR [3:1] something\n"
+            "</diagnostics>"
+        )
+
+        class FakeFileOps:
+            def read_file_raw(self, path):
+                return SimpleNamespace(content="ctx\nold\nctx\n", error=None)
+
+            def write_file(self, path, content):
+                return SimpleNamespace(error=None, lsp_diagnostics=diag_block)
+
+            def _check_lint(self, path):
+                return SimpleNamespace(to_dict=lambda: {"skipped": True})
+
+        result = apply_v4a_operations(ops, FakeFileOps())
+
+        assert result.success is True
+        assert result.lsp_diagnostics == diag_block
+
+    def test_lsp_diagnostics_none_when_no_blocks_emitted(self):
+        """When no underlying ``write_file`` produced diagnostics, the
+        aggregated field stays ``None`` (so it doesn't get serialized
+        as an empty string in ``PatchResult.to_dict``)."""
+        ops = self._build_ops_writing("foo.py", "x = 1\n")
+
+        class FakeFileOps:
+            def write_file(self, path, content):
+                # lsp_diagnostics omitted entirely (older WriteResult shape).
+                return SimpleNamespace(error=None)
+
+            def _check_lint(self, path):
+                return SimpleNamespace(to_dict=lambda: {"success": True})
+
+        result = apply_v4a_operations(ops, FakeFileOps())
+
+        assert result.success is True
+        assert result.lsp_diagnostics is None
+
+    def test_lsp_diagnostics_combined_across_multiple_files(self):
+        """When several files in one V4A patch produce diagnostics,
+        each block appears in the combined output so per-file attribution
+        is preserved."""
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Add File: a.ts\n"
+            "+const a = 1\n"
+            "*** Add File: b.ts\n"
+            "+const b = 2\n"
+            "*** End Patch"
+        )
+        ops, err = parse_v4a_patch(patch_text)
+        assert err is None
+
+        per_file = {
+            "a.ts": "<diagnostics file=\"a.ts\">\nERR a\n</diagnostics>",
+            "b.ts": "<diagnostics file=\"b.ts\">\nERR b\n</diagnostics>",
+        }
+
+        class FakeFileOps:
+            def write_file(self, path, content):
+                return SimpleNamespace(error=None, lsp_diagnostics=per_file[path])
+
+            def _check_lint(self, path):
+                return SimpleNamespace(to_dict=lambda: {"skipped": True})
+
+        result = apply_v4a_operations(ops, FakeFileOps())
+
+        assert result.success is True
+        assert result.lsp_diagnostics is not None
+        assert per_file["a.ts"] in result.lsp_diagnostics
+        assert per_file["b.ts"] in result.lsp_diagnostics

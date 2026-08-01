@@ -8,11 +8,15 @@ of 4000+ models across 109+ providers.  Provides:
   (reasoning, tools, vision, PDF, audio), modalities, knowledge cutoff,
   open-weights flag, family grouping, deprecation status
 
-Data resolution order (like TypeScript OpenCode):
-  1. Bundled snapshot (ships with the package — offline-first)
-  2. Disk cache (~/.hermes/models_dev_cache.json)
-  3. Network fetch (https://models.dev/api.json)
-  4. Background refresh every 60 minutes
+Data resolution order:
+  1. In-memory cache (fresh, or stale served immediately while a single
+     background daemon thread refreshes)
+  2. Disk cache (~/.hermes/models_dev_cache.json — any age; stale data is
+     served rather than blocking callers on the network)
+  3. Network fetch (https://models.dev/api.json) — only when no cache
+     exists at all; failed refreshes back off for 5 minutes process-wide
+Latency-sensitive callers (gateway route-identity checks) pass
+``allow_network=False`` and never touch the network.
 
 Other modules should import the dataclasses and query functions from here
 rather than parsing the raw JSON themselves.
@@ -20,6 +24,7 @@ rather than parsing the raw JSON themselves.
 
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,10 +38,15 @@ logger = logging.getLogger(__name__)
 
 MODELS_DEV_URL = "https://models.dev/api.json"
 _MODELS_DEV_CACHE_TTL = 3600  # 1 hour in-memory
+_MODELS_DEV_RETRY_DELAY = 300  # 5 minutes after a failed refresh
 
 # In-memory cache
 _models_dev_cache: Dict[str, Any] = {}
 _models_dev_cache_time: float = 0
+_models_dev_retry_after: float = 0
+_models_dev_fetch_lock = threading.Lock()
+_models_dev_refresh_lock = threading.Lock()
+_models_dev_refresh_in_flight = False
 
 
 # ---------------------------------------------------------------------------
@@ -141,14 +151,18 @@ class ProviderInfo:
 # Hermes provider names → models.dev provider IDs
 PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "openrouter": "openrouter",
+    "novita": "novita-ai",
     "anthropic": "anthropic",
     "openai": "openai",
     "openai-codex": "openai",
     "zai": "zai",
+    "kimi": "kimi-for-coding",
     "kimi-coding": "kimi-for-coding",
+    "moonshot": "kimi-for-coding",
     "stepfun": "stepfun",
     "kimi-coding-cn": "kimi-for-coding",
     "minimax": "minimax",
+    "minimax-oauth": "minimax",
     "minimax-cn": "minimax-cn",
     "deepseek": "deepseek",
     "alibaba": "alibaba",
@@ -163,6 +177,9 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "gemini": "google",
     "google": "google",
     "xai": "xai",
+    # xAI OAuth is an authentication/transport path for the same xAI model
+    # catalog, so model metadata should resolve through the xAI provider.
+    "xai-oauth": "xai",
     "xiaomi": "xiaomi",
     "nvidia": "nvidia",
     "groq": "groq",
@@ -196,6 +213,32 @@ def _load_disk_cache() -> Dict[str, Any]:
     return {}
 
 
+def _disk_cache_age_seconds() -> Optional[float]:
+    """Return age (in seconds) of the disk cache file, or None if missing.
+
+    Used by ``fetch_models_dev`` to short-circuit the network probe when
+    a recent on-disk cache exists. Errors (missing file, permission
+    denied, weird filesystem) all return None — callers fall through
+    to the network fetch path.
+    """
+    try:
+        cache_path = _get_cache_path()
+        if not cache_path.exists():
+            return None
+        mtime = cache_path.stat().st_mtime
+        age = time.time() - mtime
+        # Negative age means the file's mtime is in the future (clock skew
+        # or system clock reset). Treat as "unknown freshness" → fall
+        # through to network so we don't serve potentially-bad data
+        # forever.
+        if age < 0:
+            return None
+        return age
+    except Exception as e:
+        logger.debug("Failed to stat models.dev disk cache: %s", e)
+        return None
+
+
 def _save_disk_cache(data: Dict[str, Any]) -> None:
     """Save models.dev data to disk cache atomically."""
     try:
@@ -205,14 +248,160 @@ def _save_disk_cache(data: Dict[str, Any]) -> None:
         logger.debug("Failed to save models.dev disk cache: %s", e)
 
 
-def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
-    """Fetch models.dev registry. In-memory cache (1hr) + disk fallback.
+def _fetch_models_dev_from_network() -> Dict[str, Any]:
+    """Fetch the live models.dev registry without touching local caches.
+
+    Raises on network errors and on an empty/invalid registry payload.
+    """
+    # Tuple (connect, read): a flat timeout=15 let a blackholed connect
+    # stall the first-turn critical path for the full 15 s. 5 s connect
+    # fails fast on unreachable hosts; 10 s read still tolerates a slow
+    # registry response (matches the OpenRouter fetch convention in
+    # agent/model_metadata.py).
+    response = requests.get(MODELS_DEV_URL, timeout=(5, 10))
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or not data:
+        raise ValueError("models.dev returned an empty or invalid registry")
+    return data
+
+
+def _mark_stale_cache_grace() -> None:
+    """Give stale cache data a short in-memory grace before retrying refresh.
+
+    Only ever moves the timestamp forward: if a background refresh completed
+    between the caller's staleness check and this call, the fresh timestamp
+    is preserved instead of being rewound to a 5-minute grace.
+    """
+    global _models_dev_cache_time
+    grace_time = time.time() - _MODELS_DEV_CACHE_TTL + _MODELS_DEV_RETRY_DELAY
+    if grace_time > _models_dev_cache_time:
+        _models_dev_cache_time = grace_time
+
+
+def _commit_registry(data: Dict[str, Any], *, where: str) -> None:
+    """Persist a freshly fetched registry: disk + in-mem + clear backoff.
+
+    Callers must hold ``_models_dev_fetch_lock`` so a failing refresh on one
+    path can never stomp the state a succeeding refresh on the other path
+    just committed (e.g. a failing background worker re-arming the backoff
+    immediately after a successful ``force_refresh``).
+    """
+    global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
+    _save_disk_cache(data)
+    _models_dev_cache = data
+    _models_dev_cache_time = time.time()
+    _models_dev_retry_after = 0
+    logger.debug(
+        "Refreshed models.dev registry (%s): %d providers, %d total models",
+        where,
+        len(data),
+        sum(len(p.get("models", {})) for p in data.values() if isinstance(p, dict)),
+    )
+
+
+def _note_refresh_failure(exc: Exception, *, where: str) -> None:
+    """Record a failed refresh: arm the process-wide 5-minute backoff.
+
+    Callers must hold ``_models_dev_fetch_lock`` (see ``_commit_registry``).
+    """
+    global _models_dev_retry_after
+    _models_dev_retry_after = time.time() + _MODELS_DEV_RETRY_DELAY
+    logger.debug(
+        "models.dev refresh failed (%s); retry suppressed for %ds: %s",
+        where,
+        _MODELS_DEV_RETRY_DELAY,
+        exc,
+    )
+
+
+def _background_refresh_models_dev() -> None:
+    """Best-effort refresh after serving stale cache data."""
+    global _models_dev_refresh_in_flight
+    try:
+        data = _fetch_models_dev_from_network()
+        with _models_dev_fetch_lock:
+            _commit_registry(data, where="background")
+    except Exception as e:
+        with _models_dev_fetch_lock:
+            _note_refresh_failure(e, where="background")
+    finally:
+        with _models_dev_refresh_lock:
+            _models_dev_refresh_in_flight = False
+
+
+def _start_background_refresh_models_dev() -> None:
+    """Start one daemon refresh worker if none is already running.
+
+    Honors the process-wide failure backoff: after a failed refresh,
+    no new background worker is spawned until ``_models_dev_retry_after``.
+    """
+    global _models_dev_refresh_in_flight
+    if time.time() < _models_dev_retry_after:
+        return
+    with _models_dev_refresh_lock:
+        if _models_dev_refresh_in_flight:
+            return
+        _models_dev_refresh_in_flight = True
+    thread = threading.Thread(
+        target=_background_refresh_models_dev,
+        name="models-dev-refresh",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except Exception as e:
+        # Thread/fd exhaustion: clear the flag so refresh isn't disabled
+        # for the rest of the process lifetime. Callers still get stale data.
+        with _models_dev_refresh_lock:
+            _models_dev_refresh_in_flight = False
+        logger.debug("Failed to start models.dev refresh thread: %s", e)
+
+
+def fetch_models_dev(
+    force_refresh: bool = False, *, allow_network: bool = True
+) -> Dict[str, Any]:
+    """Fetch models.dev registry. Cache hierarchy: in-mem → disk → network.
 
     Returns the full registry dict keyed by provider ID, or empty dict on failure.
-    """
-    global _models_dev_cache, _models_dev_cache_time
 
-    # Check in-memory cache
+    Cache hierarchy (when ``force_refresh=False``):
+      1. Fresh in-memory cache → return immediately.
+      2. Stale in-memory cache → return immediately and refresh in a single
+         background daemon thread. Callers never block on the network while
+         any cache exists; ``models.dev`` only changes when providers add
+         new models, so stale data is preferable to a foreground timeout.
+      3. Disk cache file (any age) → load, populate in-mem, return
+         immediately. Stale disk caches trigger the same background refresh.
+      4. No cache at all → singleflight foreground network fetch. On
+         success, save to disk + in-mem and return.
+      5. Any failed refresh (foreground or background) suppresses further
+         automatic refreshes for 5 minutes process-wide.
+
+    When ``force_refresh=True`` (used by ``hermes config refresh``, the
+    \"refresh model catalog\" code path), cache fast paths and the failure
+    backoff are bypassed; the function hits the network and only falls back
+    to cached data if the call fails. When ``allow_network=False``, any
+    memory or disk cache is returned regardless of age and no request is
+    made — used by latency-sensitive paths (gateway route-identity checks)
+    that must never wait on the network.
+    """
+    global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
+
+    if not allow_network:
+        if _models_dev_cache:
+            return _models_dev_cache
+        disk_data = _load_disk_cache()
+        if disk_data:
+            _models_dev_cache = disk_data
+            disk_age = _disk_cache_age_seconds()
+            _models_dev_cache_time = (
+                time.time() - disk_age if disk_age is not None else 0
+            )
+        return _models_dev_cache
+
+    # Stage 1: fresh in-memory cache wins. This is the hot path on
+    # long-lived processes — no I/O, no system calls.
     if (
         not force_refresh
         and _models_dev_cache
@@ -220,33 +409,82 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
     ):
         return _models_dev_cache
 
-    # Try network fetch
-    try:
-        response = requests.get(MODELS_DEV_URL, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, dict) and data:
-            _models_dev_cache = data
-            _models_dev_cache_time = time.time()
-            _save_disk_cache(data)
-            logger.debug(
-                "Fetched models.dev registry: %d providers, %d total models",
-                len(data),
-                sum(len(p.get("models", {})) for p in data.values() if isinstance(p, dict)),
-            )
+    # Stage 2: stale in-memory cache is still better than blocking provider
+    # resolution on a foreground network timeout. Refresh it in the background.
+    if not force_refresh and _models_dev_cache:
+        _mark_stale_cache_grace()
+        _start_background_refresh_models_dev()
+        logger.debug(
+            "Using stale in-memory models.dev cache; refreshing in background"
+        )
+        return _models_dev_cache
+
+    # Stage 3: disk cache short-circuits the network call.
+    # Only kicks in on cold-start processes (in-mem cache is empty) and only
+    # when the user hasn't asked for a forced refresh. A stale disk cache is
+    # deliberately usable: provider/model resolution should not hang just
+    # because models.dev is unreachable.
+    if not force_refresh:
+        disk_age = _disk_cache_age_seconds()
+        if disk_age is not None:
+            disk_data = _load_disk_cache()
+            if disk_data:
+                _models_dev_cache = disk_data
+                if disk_age < _MODELS_DEV_CACHE_TTL:
+                    # Anchor in-mem TTL to the disk file's age so we don't
+                    # extend an already-aging cache by another full hour.
+                    _models_dev_cache_time = time.time() - disk_age
+                    logger.debug(
+                        "Loaded models.dev from fresh disk cache "
+                        "(%d providers, age=%.0fs)", len(disk_data), disk_age,
+                    )
+                else:
+                    _mark_stale_cache_grace()
+                    _start_background_refresh_models_dev()
+                    logger.debug(
+                        "Using stale models.dev disk cache (age=%.0fs); "
+                        "refreshing in background",
+                        disk_age,
+                    )
+                return _models_dev_cache
+
+    # Failed automatic refreshes are process-wide. Avoid making every caller
+    # retry the same unreachable endpoint while no usable cache exists.
+    if not force_refresh and time.time() < _models_dev_retry_after:
+        return _models_dev_cache
+
+    # Stage 4: singleflight foreground network fetch — only reached when no
+    # memory or disk cache exists (or on force_refresh). Recheck state after
+    # acquiring the lock because another caller may have refreshed or
+    # established backoff while we waited.
+    with _models_dev_fetch_lock:
+        now = time.time()
+        if not force_refresh:
+            if _models_dev_cache:
+                return _models_dev_cache
+            if now < _models_dev_retry_after:
+                return _models_dev_cache
+
+        try:
+            data = _fetch_models_dev_from_network()
+            _commit_registry(data, where="foreground")
             return data
-    except Exception as e:
-        logger.debug("Failed to fetch models.dev: %s", e)
+        except Exception as e:
+            _note_refresh_failure(e, where="foreground")
 
-    # Fall back to disk cache — use a short TTL (5 min) so we retry
-    # the network fetch soon instead of serving stale data for a full hour.
-    if not _models_dev_cache:
-        _models_dev_cache = _load_disk_cache()
-        if _models_dev_cache:
-            _models_dev_cache_time = time.time() - _MODELS_DEV_CACHE_TTL + 300
-            logger.debug("Loaded models.dev from disk cache (%d providers)", len(_models_dev_cache))
+        # Stage 5: network failed — return any stale memory/disk cache. Cache
+        # freshness remains expired; the retry-after timestamp controls when
+        # the next automatic request is allowed.
+        if not _models_dev_cache:
+            _models_dev_cache = _load_disk_cache()
+            _models_dev_cache_time = 0
+            if _models_dev_cache:
+                logger.debug(
+                    "Loaded stale models.dev disk cache (%d providers)",
+                    len(_models_dev_cache),
+                )
 
-    return _models_dev_cache
+        return _models_dev_cache
 
 
 def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
@@ -282,6 +520,28 @@ def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
             ctx = _extract_context(mdata)
             if ctx:
                 return ctx
+
+    # Suffix-aware fallback: some providers (e.g. ollama-cloud) store
+    # model IDs with :cloud / -cloud suffixes in models.dev while the
+    # live API returns bare names.  Without this, kimi-k2.6 misses the
+    # kimi-k2.6:cloud entry and falls through to stale OpenRouter metadata
+    # reporting 32768 — tripping the 64k minimum-context guard.
+    # The suffix-stripping in fetch_ollama_cloud_models() handles the
+    # model-picker UX; this handles the context-length lookup path.
+    for suffix in (":cloud", "-cloud"):
+        suffixed_key = model + suffix
+        entry = models.get(suffixed_key)
+        if entry:
+            ctx = _extract_context(entry)
+            if ctx:
+                return ctx
+        # Also try case-insensitive
+        suffixed_lower = model_lower + suffix
+        for mid, mdata in models.items():
+            if mid.lower() == suffixed_lower:
+                ctx = _extract_context(mdata)
+                if ctx:
+                    return ctx
 
     return None
 
@@ -380,14 +640,18 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
 
     # Extract capability flags (default to False if missing)
     supports_tools = bool(entry.get("tool_call", False))
-    # Vision: check both the `attachment` flag and `modalities.input` for "image".
-    # Some models (e.g. gemma-4) list image in input modalities but not attachment.
+    # Vision: prefer explicit `modalities.input` when models.dev provides it.
+    # The older `attachment` flag can be stale or too broad for image routing;
+    # fall back to it only when the input modalities are absent/invalid.
     input_mods = entry.get("modalities", {})
     if isinstance(input_mods, dict):
-        input_mods = input_mods.get("input", [])
+        input_mods = input_mods.get("input")
     else:
-        input_mods = []
-    supports_vision = bool(entry.get("attachment", False)) or "image" in input_mods
+        input_mods = None
+    if isinstance(input_mods, list):
+        supports_vision = "image" in input_mods
+    else:
+        supports_vision = bool(entry.get("attachment", False))
     supports_reasoning = bool(entry.get("reasoning", False))
 
     # Extract limits
@@ -418,6 +682,9 @@ def list_provider_models(provider: str) -> List[str]:
 
     Returns an empty list if the provider is unknown or has no data.
     """
+    from hermes_cli.models import normalize_provider
+    provider = normalize_provider(provider) or provider
+    
     models = _get_provider_models(provider)
     if models is None:
         return []
@@ -573,7 +840,9 @@ def _parse_provider_info(provider_id: str, raw: Dict[str, Any]) -> ProviderInfo:
 # Provider-level queries
 # ---------------------------------------------------------------------------
 
-def get_provider_info(provider_id: str) -> Optional[ProviderInfo]:
+def get_provider_info(
+    provider_id: str, *, allow_network: bool = True
+) -> Optional[ProviderInfo]:
     """Get full provider metadata from models.dev.
 
     Accepts either a Hermes provider ID (e.g. "kilocode") or a models.dev
@@ -582,7 +851,14 @@ def get_provider_info(provider_id: str) -> Optional[ProviderInfo]:
     # Resolve Hermes ID → models.dev ID
     mdev_id = PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
 
-    data = fetch_models_dev()
+    # NOTE: keep the zero-argument call on the default path. Dozens of test
+    # sites monkeypatch fetch_models_dev with zero-arg lambdas; passing the
+    # kwarg unconditionally would break them all (they raise TypeError).
+    data = (
+        fetch_models_dev()
+        if allow_network
+        else fetch_models_dev(allow_network=False)
+    )
     raw = data.get(mdev_id)
     if not isinstance(raw, dict):
         return None
