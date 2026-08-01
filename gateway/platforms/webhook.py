@@ -181,6 +181,17 @@ def _route_lifecycle_correlation(route: dict, payload: dict | None = None) -> di
         raise ValueError("lifecycle request correlation is missing")
     return correlation
 
+
+def _validate_lifecycle_route(route: dict) -> None:
+    """Fail closed before send when a route cannot produce lifecycle evidence."""
+    if route.get("lifecycle") is None:
+        return
+    _route_lifecycle_correlation(route)
+    if route.get("deliver") == "github_comment":
+        raise ValueError(
+            "lifecycle receipts require a delivery target with a provider message ID"
+        )
+
 # Default bind host. ``None`` tells aiohttp/asyncio's ``create_server`` to bind
 # BOTH address families (IPv4 + IPv6) — the portable dual-stack default.
 #
@@ -357,7 +368,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     )
                 if route.get("lifecycle") is not None:
                     try:
-                        _route_lifecycle_correlation(route)
+                        _validate_lifecycle_route(route)
                     except ValueError as exc:
                         raise ValueError(
                             f"[webhook] Route '{name}' has {exc}"
@@ -601,6 +612,15 @@ class WebhookAdapter(BasePlatformAdapter):
                         "is only allowed on loopback hosts. Current host: '%s'.",
                         k,
                         self._host,
+                    )
+                    continue
+                try:
+                    _validate_lifecycle_route(v)
+                except ValueError as exc:
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' skipped: invalid lifecycle metadata: %s",
+                        k,
+                        exc,
                     )
                     continue
                 new_dynamic[k] = v
@@ -903,6 +923,18 @@ class WebhookAdapter(BasePlatformAdapter):
         # to a user's chat with zero LLM cost.  Reuses the same HMAC auth,
         # rate limiting, idempotency, and template rendering as agent mode.
         if route_config.get("deliver_only"):
+            try:
+                _validate_lifecycle_route(route_config)
+            except ValueError as exc:
+                logger.error(
+                    "[webhook] refusing direct delivery with invalid lifecycle route=%s: %s",
+                    route_name,
+                    exc,
+                )
+                return web.json_response(
+                    {"status": "error", "error": "Invalid lifecycle configuration", "delivery_id": delivery_id},
+                    status=500,
+                )
             delivery = {
                 "deliver": route_config.get("deliver", "log"),
                 "deliver_extra": self._render_delivery_extra(

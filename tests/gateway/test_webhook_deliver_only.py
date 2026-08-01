@@ -254,6 +254,29 @@ class TestDeliverOnlyStartupValidation:
         with pytest.raises(ValueError, match="invalid lifecycle metadata"):
             await adapter.connect()
 
+    @pytest.mark.asyncio
+    async def test_rejects_github_comment_lifecycle_before_send(self):
+        adapter = _make_adapter({
+            "github": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "github_comment",
+                "deliver_only": True,
+                "deliver_extra": {"repo": "org/repo", "pr_number": "1"},
+                "prompt": "hi",
+                "lifecycle": {
+                    "route_revision": "route-r1",
+                    "destination_revision": "destination-r1",
+                    "plugin_revision": "plugin-r1",
+                    "expected_conversation_key": "agent:main:github:issue:1",
+                    "dispatch_id_field": "dispatch_id",
+                    "activation_attempt_id_field": "activation_attempt_id",
+                },
+            }
+        })
+
+        with pytest.raises(ValueError, match="provider message ID"):
+            await adapter.connect()
+
 
 # ===================================================================
 # Security + reliability invariants still hold

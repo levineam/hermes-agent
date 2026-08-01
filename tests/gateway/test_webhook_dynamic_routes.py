@@ -84,4 +84,21 @@ class TestDynamicRouteSecretValidation:
         adapter._reload_dynamic_routes()
         assert "valid" in adapter._routes
 
+    def test_invalid_lifecycle_route_is_rejected_during_hot_reload(self, tmp_path):
+        (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(
+            json.dumps({
+                "invalid-lifecycle": {
+                    "secret": "dynamic-secret",
+                    "deliver": "telegram",
+                    "deliver_only": True,
+                    "lifecycle": {"dispatch_id_field": "dispatch_id"},
+                }
+            })
+        )
+
+        adapter = _make_adapter()
+        adapter._reload_dynamic_routes()
+
+        assert "invalid-lifecycle" not in adapter._routes
+        assert "invalid-lifecycle" not in adapter._dynamic_routes
 
